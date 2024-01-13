@@ -15,10 +15,13 @@ pub struct IntegrationSpec {
     #[garde(length(min = 3))]
     service: String,
     #[garde(skip)]
-    secret: String,
+    secret: Option<String>,
 }
+
+pub type URI = String;
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 pub struct IntegrationStatus {
-    integration_key: String,
+    pub integration: Option<URI>,
+    pub error: Option<String>,
 }

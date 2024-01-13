@@ -1,41 +1,177 @@
-use std::{sync::Arc, time::Duration};
-
-use futures::{StreamExt};
-
+use futures::{StreamExt, TryFutureExt};
+use pgkube::Integration;
+use serde_json::json;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tracing::*;
 
 use kube::{
-    api::{Api, ResourceExt},
-    runtime::{Controller, controller::Action},
-    Client
+    api::{Api, Patch, PatchParams, ResourceExt},
+    core::ObjectMeta,
+    runtime::{controller::Action, Controller},
+    Client, Resource,
 };
 
+use k8s_openapi::{api::core::v1::Secret, Metadata};
+
 #[derive(thiserror::Error, Debug)]
-pub enum Error {}
+pub enum Error {
+    #[error("Kube API Error")]
+    KubeAPI(#[from] kube::Error),
+    #[error("Unknown")]
+    Unknown,
+}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
+struct Ctx {
+    client: Client
+}
+
 #[tokio::main]
-async fn main() -> Result<(), kube::Error> {
+async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt::init();
     let client = Client::try_default().await?;
 
-    let integrations: Api<pgkube::Integration> = Api::default_namespaced(client);
+    let integrations: Api<pgkube::Integration> = Api::all(client.clone());
+    let secrets = Api::<Secret>::all(client.clone());
+    let ctx = Ctx {
+        client: client.clone()
+    };
     debug!("Hello, world!");
 
     Controller::new(integrations.clone(), Default::default())
-        .run(reconcile, error_policy, Arc::new(()))
+        .owns(secrets, Default::default())
+        .run(reconcile, error_policy, Arc::new(ctx.clone()))
         .for_each(|_| futures::future::ready(()))
         .await;
 
     Ok(())
 }
 
-async fn reconcile(obj: Arc<pgkube::Integration>, _ctx: Arc<()>) -> Result<Action> {
-    info!("reconcile request: {}", obj.name_any());
-    Ok(Action::requeue(Duration::from_secs(3600)))
+async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Action> {
+    info!(
+        "reconcile request: {:?} - {}",
+        obj.metadata.namespace.clone().unwrap(),
+        obj.name_any()
+    );
+
+    let pgres = obj.status.clone()
+    .map_or_else(|| create_pagerduty_integration(&obj), |_| get_pagerduty_integration(&obj))?;
+
+    let other_ctx = ctx.clone();
+
+    let secret = create_secret(obj.as_ref(), pgres.clone().key)
+    .map(|s| async move {
+            debug!("secret is {:?}",serde_yaml::to_string(&s));
+            Api::<Secret>::namespaced(other_ctx.client.clone(), s.metadata().namespace.clone().unwrap().as_ref())
+            .patch(
+                &s.name_any(),
+                &PatchParams::apply("pgkubecontroller"),
+                &Patch::Apply(&s))
+            .map_err(Error::KubeAPI)
+            .await
+            }
+    )?.await;
+
+    let status_update = patch_status(pgres.clone(), obj.clone(), ctx.clone()).await;
+
+    match (secret, status_update) {
+        (Ok(secret), Ok(status)) => {
+            debug!("Updated secret {:?}: {} and status {:?}: {}",secret.namespace(), secret.name_any(), status.namespace(), status.name_any());
+            Ok(Action::await_change())
+        },
+        (Err(e), Ok(status)) => {
+            debug!("status {:?}: {}", status.namespace(), status.name_any());
+            warn!("Error updating secret {}", e);
+            Ok(Action::requeue(Duration::from_secs(30)))
+        },
+        (Ok(secret), Err(e)) => {
+            debug!("Updated secret {:?}: {}", secret.namespace(), secret.name_any());
+            warn!("Error updating status {:?}", e);
+            Ok(Action::requeue(Duration::from_secs(30)))
+        },
+        (Err(e1), Err(e2)) => {
+            warn!("Error updating secret {:?}", e1);
+            warn!("Error updating status {:?}", e2);
+            Ok(Action::requeue(Duration::from_secs(30)))
+        },
+
+    }
+
+    
 }
 
-fn error_policy(_object: Arc<pgkube::Integration>, _err: &Error, _ctx: Arc<()>) -> Action {
+async fn patch_status(
+    integration: PGIntegration,
+    obj: Arc<pgkube::Integration>,
+    ctx: Arc<Ctx>,
+) -> Result<Integration, Error> {
+    let status = json!({
+        "status": pgkube::IntegrationStatus{ integration: Some(integration.url), ..Default::default()}
+    });
+    Api::<Integration>::namespaced(ctx.client.clone(), obj.namespace().unwrap().as_str())
+    .patch_status(
+        &obj.name_any(),
+        &PatchParams::default(),
+        &Patch::Merge(&status),
+    )
+    .await
+    .map_err(Error::KubeAPI)
+}
+
+fn create_secret(integration: &Integration, key: String) -> Result<Secret,Error> {
+    info!(
+        "create secret"
+    );
+
+    let owner_ref = integration.controller_owner_ref(&()).unwrap();
+
+    Ok(Secret {
+        metadata: ObjectMeta {
+            name: integration.metadata.name.clone(),
+            namespace: integration.metadata.namespace.clone(),
+            owner_references: Some(vec![owner_ref]),
+            ..ObjectMeta::default()
+        },
+        string_data: Some(BTreeMap::from([("key".to_owned(), key)])),
+        ..Default::default()
+    })
+}
+
+#[derive(Clone)]
+struct PGIntegration {
+    url: String,
+    service: String,
+    key: String,
+}
+
+#[instrument]
+fn get_pagerduty_integration(integration: &Integration) -> Result<PGIntegration, Error> {
+    info!(
+        "get pg integration: {:?}",
+        integration.name_any()
+    );
+    Ok(PGIntegration {
+        url: "https://api.pagerduty.com/services/PQL78HM/integrations/PE1U9CH".to_string(),
+        service: "https://api.pagerduty.com/services/PQL78HM".to_string(),
+        key: integration.name_any(),
+    })
+}
+
+#[instrument]
+fn create_pagerduty_integration(integration: &Integration) -> Result<PGIntegration, Error> {
+    info!(
+        "Create pg integration: {:?}",
+        integration.name_any()
+    );
+    Ok(PGIntegration {
+        url: "https://api.pagerduty.com/services/PQL78HM/integrations/PABCDEF".to_string(),
+        service: "https://api.pagerduty.com/services/PQZXYW".to_string(),
+        key: integration.name_any(),
+    })
+}
+
+fn error_policy(_object: Arc<pgkube::Integration>, _err: &Error, _ctx: Arc<Ctx>) -> Action {
     Action::requeue(Duration::from_secs(5))
 }
