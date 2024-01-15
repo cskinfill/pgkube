@@ -1,4 +1,4 @@
-use futures::{StreamExt, TryFutureExt};
+use futures::{StreamExt, TryFutureExt, future::join};
 use pgkube::Integration;
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -27,6 +27,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 struct Ctx {
     client: Client
 }
+
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -59,24 +60,12 @@ async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Actio
     let pgres = obj.status.clone()
     .map_or_else(|| create_pagerduty_integration(&obj), |_| get_pagerduty_integration(&obj))?;
 
-    let other_ctx = ctx.clone();
-
     let secret = create_secret(obj.as_ref(), pgres.clone().key)
-    .map(|s| async move {
-            debug!("secret is {:?}",serde_yaml::to_string(&s));
-            Api::<Secret>::namespaced(other_ctx.client.clone(), s.metadata().namespace.clone().unwrap().as_ref())
-            .patch(
-                &s.name_any(),
-                &PatchParams::apply("pgkubecontroller"),
-                &Patch::Apply(&s))
-            .map_err(Error::KubeAPI)
-            .await
-            }
-    )?.await;
+    .map(|secret| patch_secret(ctx.clone().client.clone(), secret))?;
 
-    let status_update = patch_status(pgres.clone(), obj.clone(), ctx.clone()).await;
+    let status_update = patch_status(pgres.clone(), obj.clone(), ctx.clone().client.clone());
 
-    match (secret, status_update) {
+    match join(secret, status_update).await {
         (Ok(secret), Ok(status)) => {
             debug!("Updated secret {:?}: {} and status {:?}: {}",secret.namespace(), secret.name_any(), status.namespace(), status.name_any());
             Ok(Action::await_change())
@@ -102,15 +91,26 @@ async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Actio
     
 }
 
+async fn patch_secret(client: Client, secret: Secret) -> Result<Secret, Error> {
+    debug!("secret is {:?}",serde_yaml::to_string(&secret));
+    Api::<Secret>::namespaced(client, secret.metadata().namespace.clone().unwrap().as_ref())
+    .patch(
+        &secret.name_any(),
+        &PatchParams::apply("pgkubecontroller"),
+        &Patch::Apply(&secret))
+    .map_err(Error::KubeAPI)
+    .await
+}
+
 async fn patch_status(
     integration: PGIntegration,
     obj: Arc<pgkube::Integration>,
-    ctx: Arc<Ctx>,
+    client: Client,
 ) -> Result<Integration, Error> {
     let status = json!({
         "status": pgkube::IntegrationStatus{ integration: Some(integration.url), ..Default::default()}
     });
-    Api::<Integration>::namespaced(ctx.client.clone(), obj.namespace().unwrap().as_str())
+    Api::<Integration>::namespaced(client, obj.namespace().unwrap().as_str())
     .patch_status(
         &obj.name_any(),
         &PatchParams::default(),
