@@ -68,7 +68,7 @@ async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Actio
     match join(secret, status_update).await {
         (Ok(secret), Ok(status)) => {
             debug!("Updated secret {:?}: {} and status {:?}: {}",secret.namespace(), secret.name_any(), status.namespace(), status.name_any());
-            Ok(Action::await_change())
+            Ok(Action::requeue(Duration::from_secs(60 * 60)))
         },
         (Err(e), Ok(status)) => {
             debug!("status {:?}: {}", status.namespace(), status.name_any());
@@ -121,7 +121,7 @@ async fn patch_status(
 }
 
 fn create_secret(integration: &Integration, key: String) -> Result<Secret,Error> {
-    info!(
+    debug!(
         "create secret"
     );
 
@@ -152,6 +152,7 @@ fn get_pagerduty_integration(integration: &Integration) -> Result<PGIntegration,
         "get pg integration: {:?}",
         integration.name_any()
     );
+    // returns mock API response
     Ok(PGIntegration {
         url: "https://api.pagerduty.com/services/PQL78HM/integrations/PE1U9CH".to_string(),
         service: "https://api.pagerduty.com/services/PQL78HM".to_string(),
@@ -165,6 +166,7 @@ fn create_pagerduty_integration(integration: &Integration) -> Result<PGIntegrati
         "Create pg integration: {:?}",
         integration.name_any()
     );
+    // returns mock API response
     Ok(PGIntegration {
         url: "https://api.pagerduty.com/services/PQL78HM/integrations/PABCDEF".to_string(),
         service: "https://api.pagerduty.com/services/PQZXYW".to_string(),
