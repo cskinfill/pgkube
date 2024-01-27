@@ -1,4 +1,4 @@
-use futures::{StreamExt, TryFutureExt, future::join};
+use futures::{StreamExt, TryFutureExt, future::join, FutureExt};
 use pgkube::Integration;
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -50,12 +50,8 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+#[instrument(skip(ctx), fields(trace_id))]
 async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Action> {
-    info!(
-        "reconcile request: {:?} - {}",
-        obj.metadata.namespace.clone().unwrap(),
-        obj.name_any()
-    );
 
     let pgres = obj.status.clone()
     .map_or_else(|| create_pagerduty_integration(&obj), |_| get_pagerduty_integration(&obj))?;
@@ -64,7 +60,7 @@ async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Actio
     .map(|secret| patch_secret(ctx.clone().client.clone(), secret))?;
 
     let status_update = patch_status(pgres.clone(), obj.clone(), ctx.clone().client.clone());
-
+    
     match join(secret, status_update).await {
         (Ok(secret), Ok(status)) => {
             debug!("Updated secret {:?}: {} and status {:?}: {}",secret.namespace(), secret.name_any(), status.namespace(), status.name_any());
