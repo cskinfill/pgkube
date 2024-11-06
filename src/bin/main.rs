@@ -1,4 +1,4 @@
-use futures::{StreamExt, TryFutureExt, future::join, FutureExt};
+use futures::{StreamExt, TryFutureExt, future::join};
 use pgkube::Integration;
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
