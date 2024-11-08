@@ -14,7 +14,8 @@ pub struct IntegrationSpec {
     #[schemars(length(min = 3))]
     #[garde(length(min = 3))]
     service: String,
-    #[garde(skip)]
+    #[schemars(length(min = 1, max = 64))]
+    #[garde(length(min = 1, max = 64))]
     secret: Option<String>,
 }
 

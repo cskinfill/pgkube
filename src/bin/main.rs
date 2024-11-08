@@ -7,7 +7,7 @@ use tracing::*;
 use kube::{
     api::{Api, Patch, PatchParams, ResourceExt},
     core::ObjectMeta,
-    runtime::{controller::Action, Controller},
+    runtime::{controller::Action, Controller, watcher},
     Client, Resource,
 };
 
@@ -41,8 +41,8 @@ async fn main() -> Result<(), Error> {
     };
     debug!("Hello, world!");
 
-    Controller::new(integrations.clone(), Default::default())
-        .owns(secrets, Default::default())
+    Controller::new(integrations.clone(), watcher::Config::default())
+        .owns(secrets, watcher::Config::default())
         .run(reconcile, error_policy, Arc::new(ctx.clone()))
         .for_each(|_| futures::future::ready(()))
         .await;
@@ -56,7 +56,7 @@ async fn reconcile(obj: Arc<pgkube::Integration>, ctx: Arc<Ctx>) -> Result<Actio
     let pgres = obj.status.clone()
     .map_or_else(|| create_pagerduty_integration(&obj), |_| get_pagerduty_integration(&obj))?;
 
-    let secret = create_secret(obj.as_ref(), pgres.clone().key)
+    let secret = create_secret(obj.as_ref(), pgres.clone())
     .map(|secret| patch_secret(ctx.clone().client.clone(), secret))?;
 
     let status_update = patch_status(pgres.clone(), obj.clone(), ctx.clone().client.clone());
@@ -116,7 +116,7 @@ async fn patch_status(
     .map_err(Error::KubeAPI)
 }
 
-fn create_secret(integration: &Integration, key: String) -> Result<Secret,Error> {
+fn create_secret(integration: &Integration, pg: PGIntegration) -> Result<Secret,Error> {
     debug!(
         "create secret"
     );
@@ -130,7 +130,7 @@ fn create_secret(integration: &Integration, key: String) -> Result<Secret,Error>
             owner_references: Some(vec![owner_ref]),
             ..ObjectMeta::default()
         },
-        string_data: Some(BTreeMap::from([("key".to_owned(), key)])),
+        string_data: Some(BTreeMap::from([("key".to_string(), pg.key), ("service".to_string(), pg.service)])),
         ..Default::default()
     })
 }
